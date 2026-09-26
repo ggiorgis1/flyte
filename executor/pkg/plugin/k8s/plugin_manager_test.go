@@ -754,3 +754,67 @@ func TestAddObjectMetadata_ManagedLabel(t *testing.T) {
 		assert.Equal(t, flytek8s.ManagedLabelValue, pod.GetLabels()[flytek8s.ManagedLabelKey])
 	})
 }
+
+// TestCheckResourcePhase_TerminatingObject covers the window between a delete request and the
+// object actually going away. Kubernetes sets deletionTimestamp to the grace-period expiry, so a
+// timestamp in the future means the workload is still shutting down and is entitled to finish.
+// Reporting that as an unexpected deletion relaunches under a name the terminating object still
+// holds, and the next reconcile sees the same timestamp again.
+func TestCheckResourcePhase_TerminatingObject(t *testing.T) {
+	newPod := func(deletionTimestamp time.Time) *v1.Pod {
+		deletion := metav1.NewTime(deletionTimestamp)
+		return &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              "pod",
+				Namespace:         "ns",
+				DeletionTimestamp: &deletion,
+				// The fake client refuses a deletionTimestamp without one.
+				Finalizers: []string{"test/finalizer"},
+			},
+			Status: v1.PodStatus{Phase: v1.PodRunning},
+		}
+	}
+
+	checkPhase := func(t *testing.T, pod *v1.Pod) pluginsCore.Transition {
+		t.Helper()
+
+		fakeClient := fake.NewClientBuilder().
+			WithScheme(k8sscheme.Scheme).
+			WithObjects(pod).
+			Build()
+
+		kubeClient := &pluginsCoreMock.KubeClient{}
+		kubeClient.EXPECT().GetClient().Return(fakeClient)
+
+		plugin := &k8sMocks.Plugin{}
+		plugin.EXPECT().GetProperties().Return(k8s.PluginProperties{})
+		plugin.EXPECT().GetTaskPhase(mock.Anything, mock.Anything, mock.Anything).
+			Return(pluginsCore.PhaseInfoRunning(pluginsCore.DefaultPhaseVersion, nil), nil)
+
+		pm := NewPluginManager("test", plugin, kubeClient)
+
+		transition, err := pm.checkResourcePhase(
+			context.Background(),
+			&pluginsCoreMock.TaskExecutionContext{},
+			&v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "pod", Namespace: "ns"}},
+			&k8s.PluginState{},
+		)
+		assert.NoError(t, err)
+		return transition
+	}
+
+	t.Run("grace period remaining is not an unexpected deletion", func(t *testing.T) {
+		transition := checkPhase(t, newPod(time.Now().Add(29*time.Second)))
+
+		assert.Equal(t, pluginsCore.PhaseRunning, transition.Info().Phase())
+		assert.Nil(t, transition.Info().Err())
+	})
+
+	t.Run("grace period expired keeps the existing behaviour", func(t *testing.T) {
+		transition := checkPhase(t, newPod(time.Now().Add(-time.Second)))
+
+		assert.Equal(t, pluginsCore.PhaseRetryableFailure, transition.Info().Phase())
+		assert.Equal(t, "UnexpectedObjectDeletion", transition.Info().Err().GetCode())
+		assert.Equal(t, core.ExecutionError_SYSTEM, transition.Info().Err().GetKind())
+	})
+}

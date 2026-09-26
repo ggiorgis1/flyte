@@ -217,6 +217,20 @@ func (pm *PluginManager) checkResourcePhase(ctx context.Context, tCtx pluginsCor
 	}
 
 	if !p.Phase().IsTerminal() && o.GetDeletionTimestamp() != nil {
+		// A deletionTimestamp is the grace-period expiry, so while it is still in the future the
+		// object is terminating rather than gone and its workload is entitled to finish. Treating
+		// that as an unexpected deletion starts a relaunch under a name the terminating object
+		// still holds, so the create fails and the next reconcile observes the same
+		// deletionTimestamp. MaxSystemFailures does not bound that loop, because the counter is
+		// reset by the non-system transition on its other half.
+		//
+		// Once the grace period has expired the object really should be gone, and the original
+		// behaviour applies. An object that has actually disappeared is handled by the IsNotFound
+		// branch above.
+		if deadline := o.GetDeletionTimestamp(); time.Now().Before(deadline.Time) {
+			return pluginsCore.DoTransition(p), nil
+		}
+
 		failureReason := fmt.Sprintf("object [%s] terminated unexpectedly in the background", nsName.String())
 		return pluginsCore.DoTransition(pluginsCore.PhaseInfoSystemRetryableFailure("UnexpectedObjectDeletion", failureReason, nil)), nil
 	}
